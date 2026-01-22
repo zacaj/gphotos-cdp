@@ -1409,10 +1409,10 @@ func albumIdFromUrl(location string) (string, error) {
 	// Split the path into segments
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 
-	// Look for "photo" segment and ensure there's a following segment
+	// Look for "album" segment and ensure there's a following segment
 	for i := 0; i < len(parts)-1; i++ {
-		if parts[i] == "album" || parts[i] == "share" {
-			return parts[i+1], nil
+		if parts[i] == "album" || parts[i] == "share" || parts[i] == *albumTypeFlag {
+			return parts[i] + "/" + parts[i+1], nil
 		}
 	}
 	return "", fmt.Errorf("could not find /share|album/{albumId} pattern in URL: %v", location)
