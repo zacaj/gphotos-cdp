@@ -257,7 +257,7 @@ func NewSession() (*Session, error) {
 				log.Warn().Msgf("-albumtype argument is ignored because it looks like given album ID already contains a type: %v", *albumIdFlag)
 			}
 			albumPath = "/" + *albumIdFlag
-			*albumIdFlag = albumPath[i+1:]
+			*albumIdFlag = albumPath[i+2:]
 		} else {
 			albumPath = "/" + *albumTypeFlag + "/" + *albumIdFlag
 		}
