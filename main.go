@@ -947,12 +947,12 @@ func (s *Session) navToEnd(ctx context.Context) error {
 }
 
 // doRun runs *runFlag as a command on the given filePath.
-func doRun(filePath, imageId string) error {
+func doRun(filePath, imageId string, date time.Time) error {
 	if *runFlag == "" {
 		return nil
 	}
 	log.Debug().Msgf("running %v on %v", *runFlag, filePath)
-	cmd := exec.Command(*runFlag, filePath, imageId)
+	cmd := exec.Command(*runFlag, filePath, imageId, date.String())
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -1536,7 +1536,7 @@ func (s *Session) processDownload(log zerolog.Logger, downloadInfo NewDownload, 
 	}
 
 	for _, f := range filePaths {
-		if err := doRun(f, imageId); err != nil {
+		if err := doRun(f, imageId, data.date); err != nil {
 			return err
 		}
 	}
