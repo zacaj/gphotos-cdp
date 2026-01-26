@@ -1,3 +1,15 @@
+zacaj/gphotos-cdp
+========
+
+Based on spraot/gphotos-cdp, this fork focuses on improving the usability/organization
+of the saved files, moving the google GUID image id based organization to a sub-folder,
+and then adding in album based and year/month based symlinks which are more 
+human-accessible.  
+
+Also, since google's image IDs change inside albums, it adds a hash+name based 
+de-duplication feature, ensuring that images shared between multiple locations are 
+only downloaded and stored once (and symlinked into the other locations as needed).
+
 gphotos-cdp
 ========
 
