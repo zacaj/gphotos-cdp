@@ -21,9 +21,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -82,7 +85,7 @@ var (
 )
 
 const gphotosUrl = "https://photos.google.com"
-const tick = 500 * time.Millisecond
+const tick = 250 * time.Millisecond
 const originalSuffix = "_original"
 
 var errStillProcessing = errors.New("video is still processing & can be downloaded later")
@@ -168,7 +171,7 @@ func main() {
 	ctx, cancel := s.NewWindow()
 	defer cancel()
 
-	startupCtx, startupCancel := context.WithTimeout(ctx, 10*time.Minute)
+	startupCtx, startupCancel := context.WithTimeout(ctx, 1*time.Minute)
 	defer startupCancel()
 
 	if err := s.login(startupCtx); err != nil {
@@ -295,11 +298,12 @@ func NewSession() (*Session, error) {
 	if downloadDir == "" {
 		downloadDir = filepath.Join(os.Getenv("HOME"), "Downloads", "gphotos-cdp")
 	}
-	if err := os.MkdirAll(downloadDir, 0700); err != nil {
+	guidDir := filepath.Join(downloadDir, "by-guid")
+	if err := os.MkdirAll(guidDir, 0700); err != nil {
 		return nil, err
 	}
 
-	downloadDirEntries, err := os.ReadDir(downloadDir)
+	guidDirEntries, err := os.ReadDir(guidDir)
 	if err != nil {
 		return nil, err
 	}
@@ -320,11 +324,14 @@ func NewSession() (*Session, error) {
 		newDownloadChan: make(chan NewDownload),
 	}
 
-	for _, e := range downloadDirEntries {
-		if e.IsDir() && e.Name() != "tmp" {
+	count := 0
+	for _, e := range guidDirEntries {
+		if e.Name() != "tmp" {
 			s.existingItems.Store(e.Name(), struct{}{})
+			count++
 		}
 	}
+	log.Info().Msgf("Found %d existing items in download directory", count)
 
 	return s, nil
 }
@@ -627,7 +634,8 @@ func listAlbums(s *Session, startupCtx context.Context, ctx context.Context, sta
 				if albumId == "" {
 					break
 				}
-				log.Info().Msgf("albumId: %s", albumId)
+				fmt.Printf("albumId: %s\n", albumId)
+				log.Info().Msgf("Found album with ID: %s", albumId)
 			}
 			log.Info().Msg("Done")
 			return nil
@@ -1421,13 +1429,15 @@ func albumIdFromUrl(location string) (string, error) {
 	return "", fmt.Errorf("could not find /share|album/{albumId} pattern in URL: %v", location)
 }
 
-// makeOutDir creates a directory in s.downloadDir named of the item ID
-func (s *Session) makeOutDir(imageId string) (string, error) {
-	newDir := filepath.Join(s.downloadDir, imageId)
+// makeOutDir creates a directory in s.downloadDir
+func (s *Session) makeOutDir(folderName string) (newPath string, err error, existed bool) {
+	newDir := filepath.Join(s.downloadDir, folderName)
+	_, err = os.Stat(newDir)
+	existed = err == nil
 	if err := os.MkdirAll(newDir, 0700); err != nil {
-		return "", err
+		return "", err, existed
 	}
-	return newDir, nil
+	return newDir, nil, existed
 }
 
 func (s *Session) waitForDownload(log zerolog.Logger, downloadInfo NewDownload, downloadProgressChan <-chan bool, imageId string) error {
@@ -1455,21 +1465,89 @@ progressLoop:
 	return nil
 }
 
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // processDownload creates a directory in s.downloadDir with name = imageId and moves the downloaded files into that directory
 func (s *Session) processDownload(log zerolog.Logger, downloadInfo NewDownload, isOriginal, hasOriginal bool, imageId string, data PhotoData) error {
 	log.Trace().Msgf("entering processDownload")
 	start := time.Now()
 
-	outDir, err := s.makeOutDir(imageId)
+	tmpPath := filepath.Join(s.downloadDirTmp, downloadInfo.GUID)
+	hash, err := hashFile(tmpPath)
 	if err != nil {
 		return err
+	}
+
+	var filename string
+	if downloadInfo.suggestedFilename != "download" && downloadInfo.suggestedFilename != "" {
+		filename = norm.NFC.String(downloadInfo.suggestedFilename)
+	} else {
+		filename = data.filename
+	}
+
+	hashDir, err, hashDirExisted := s.makeOutDir(filepath.Join("by-hash", filename+"_"+hash))
+	if err != nil {
+		return err
+	}
+
+	guidsDir, err, _ := s.makeOutDir("by-guid")
+	if err != nil {
+		return err
+	}
+	guidDir := filepath.Join(guidsDir, imageId)
+	if _, err := os.Lstat(guidDir); err != nil {
+		relativePath, err := filepath.Rel(guidsDir, hashDir)
+		if err != nil {
+			log.Error().Msgf("Error calculating relative path from %s to %s: %v\n", guidsDir, hashDir, err)
+		} else {
+			if err := os.Symlink(relativePath, guidDir); err != nil {
+				log.Error().Msgf("Error creating guid symlink from %s -> %s: %v\n", guidDir, hashDir, err)
+			} else {
+				log.Debug().Msgf("Created guid symlink %s", guidDir)
+			}
+		}
+	}
+
+	hashGuidLink := filepath.Join(hashDir, ".from-guid_"+imageId)
+	if _, err := os.Lstat(hashGuidLink); err != nil {
+		relativePath, err := filepath.Rel(hashDir, guidDir)
+		if err != nil {
+			log.Error().Msgf("Error calculating relative path from %s to %s: %v\n", hashDir, guidDir, err)
+		} else {
+			if err := os.Symlink(relativePath, hashGuidLink); err != nil {
+				log.Error().Msgf("Error creating hash -> guid symlink %s -> %s: %v\n", hashGuidLink, guidDir, err)
+			} else {
+				log.Trace().Msgf("Created hash -> guid symlink %s", hashGuidLink)
+			}
+		}
+	}
+
+	if hashDirExisted {
+		log.Warn().Msgf("imageId=%s already exists per hash %s, skipping further processing", imageId, hashDir)
+		if err := os.Remove(tmpPath); err != nil {
+			log.Error().Msgf("Could not delete tmp file %s: %v", tmpPath, err)
+		}
+		return nil
 	}
 
 	var filePaths []string
 	baseNames := []string{}
 	if strings.HasSuffix(downloadInfo.suggestedFilename, ".zip") {
 		var err error
-		filePaths, err = s.handleZip(log, filepath.Join(s.downloadDirTmp, downloadInfo.GUID), outDir)
+		filePaths, err = s.handleZip(log, tmpPath, hashDir)
 		if err != nil {
 			return err
 		}
@@ -1485,13 +1563,6 @@ func (s *Session) processDownload(log zerolog.Logger, downloadInfo NewDownload, 
 			return fmt.Errorf("expected file %s not found in downloaded zip (found %s) for %s (%w)", data.filename, strings.Join(baseNames, ", "), imageId, errUnexpectedDownload)
 		}
 	} else {
-		var filename string
-		if downloadInfo.suggestedFilename != "download" && downloadInfo.suggestedFilename != "" {
-			filename = norm.NFC.String(downloadInfo.suggestedFilename)
-		} else {
-			filename = data.filename
-		}
-
 		if isOriginal || !hasOriginal {
 			// Error if filename is not the expected filename
 			if !compareMangled(data.filename, filename) {
@@ -1505,26 +1576,48 @@ func (s *Session) processDownload(log zerolog.Logger, downloadInfo NewDownload, 
 			filename = strings.TrimSuffix(filename, ext) + originalSuffix + ext
 		}
 
-		newFile := filepath.Join(outDir, filename)
+		newFile := filepath.Join(hashDir, filename)
 		log.Debug().Msgf("moving %v to %v", downloadInfo.GUID, newFile)
-		if err := os.Rename(filepath.Join(s.downloadDirTmp, downloadInfo.GUID), newFile); err != nil {
+		if err := os.Rename(tmpPath, newFile); err != nil {
 			return err
 		}
 		filePaths = []string{newFile}
 		baseNames = append(baseNames, filepath.Base(newFile))
+	}
 
-		// create symlink if configured
-		if s.symlinkDir != "" {
-			symlinkPath := filepath.Join(s.symlinkDir, imageId)
-			if _, err := os.Stat(symlinkPath); err != nil {
-				relativePath, err := filepath.Rel(s.symlinkDir, outDir)
+	dateDir, err, _ := s.makeOutDir(data.date.Format("2006/01"))
+	if err != nil {
+		return err
+	}
+	for _, f := range filePaths {
+		datePath := filepath.Join(dateDir, filepath.Base(f))
+		if _, err := os.Lstat(datePath); err != nil {
+			relativePath, err := filepath.Rel(dateDir, f)
+			if err != nil {
+				log.Error().Msgf("Error calculating relative path from %s to %s: %v\n", datePath, f, err)
+			} else {
+				if err := os.Symlink(relativePath, datePath); err != nil {
+					log.Error().Msgf("Error creating date symlink from %s -> %s: %v\n", datePath, f, err)
+				} else {
+					log.Debug().Msgf("Created date symlink %s", datePath)
+				}
+			}
+		}
+	}
+
+	// create symlink if configured
+	if s.symlinkDir != "" {
+		for _, f := range filePaths {
+			symlinkPath := filepath.Join(s.symlinkDir, filepath.Base(f))
+			if _, err := os.Lstat(symlinkPath); err != nil {
+				relativePath, err := filepath.Rel(s.symlinkDir, f)
 				if err != nil {
-					log.Error().Msgf("Error calculating relative path from %s to %s1: %v\n", s.symlinkDir, outDir, err)
+					log.Error().Msgf("Error calculating relative path from %s to %s: %v\n", f, s.symlinkDir, err)
 				} else {
 					if err := os.Symlink(relativePath, symlinkPath); err != nil {
-						log.Error().Msgf("Error creating symlink from %s to %s1: %v\n", symlinkPath, outDir, err)
+						log.Error().Msgf("Error creating symlink from %s -> %s: %v\n", symlinkPath, f, err)
 					} else {
-						log.Debug().Msgf("Created symlink %s", symlinkPath)
+						log.Debug().Msgf("Created album symlink %s", symlinkPath)
 					}
 				}
 			}
@@ -1970,7 +2063,7 @@ syncAllLoop:
 			}
 		}
 
-		if retries > 0 && retries%10 == 0 {
+		if retries > 0 && retries%10 == 0 && estimatedRemaining != 50 {
 			// loading slow, let's give it some extra time
 			time.Sleep(1 * time.Second)
 		}
@@ -2122,7 +2215,7 @@ func (s *Session) isNewItem(log zerolog.Logger, imageId string, markFound bool) 
 	if err != nil {
 		return false, err
 	} else if hasFiles {
-		log.Trace().Msgf("skipping item, already downloaded")
+		log.Debug().Msgf("skipping item, already downloaded")
 		isNew = false
 	}
 
@@ -2389,7 +2482,7 @@ func (s *Session) dirHasFiles(imageId string) (bool, error) {
 	if _, exists := s.existingItems.Load(imageId); !exists {
 		return false, nil
 	}
-	entries, err := os.ReadDir(filepath.Join(s.downloadDir, imageId))
+	entries, err := os.ReadDir(filepath.Join(s.downloadDir, "by-guid", imageId))
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
@@ -2398,7 +2491,7 @@ func (s *Session) dirHasFiles(imageId string) (bool, error) {
 	}
 	for _, v := range entries {
 		if !v.IsDir() {
-			f, err := os.Stat(filepath.Join(s.downloadDir, imageId, v.Name()))
+			f, err := os.Stat(filepath.Join(s.downloadDir, "by-guid", imageId, v.Name()))
 			if err != nil {
 				return false, err
 			}
